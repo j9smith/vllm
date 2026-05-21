@@ -73,6 +73,7 @@ if TYPE_CHECKING:
 
 
 def _mark_cuda_dontdump() -> None:
+    logger.info("Running cuda_dontdump")
     MADV_DONTDUMP = 16
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     total_mb = 0
@@ -209,7 +210,10 @@ class Worker(WorkerBase):
         )
 
         if level == 2:
+            logger.info("Calling cuda_dontdump")
             _mark_cuda_dontdump()
+
+        logger.info("Sleep routine finished")
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
