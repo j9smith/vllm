@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import ctypes
 import gc
 import os
 from collections.abc import Callable
@@ -69,6 +70,32 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def _mark_cuda_dontdump() -> None:
+    MADV_DONTDUMP = 16
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    total_mb = 0
+    with open("/proc/self/maps") as f:
+        for line in f:
+            if "/dev/zero" not in line or "rw-s" not in line:
+                continue
+            addr_str = line.split()[0]
+            start, end = (int(x, 16) for x in addr_str.split("-"))
+            size = end - start
+            ret = libc.madvise(
+                ctypes.c_void_p(start),
+                ctypes.c_size_t(size),
+                ctypes.c_int(MADV_DONTDUMP),
+            )
+            if ret != 0:
+                errno = ctypes.get_errno()
+                logger.warning(
+                    "madvise DONTDUMP failed on %s errno=%d", addr_str, errno
+                )
+            else:
+                total_mb += size // 1024 // 1024
+    logger.info("Marked %d MiB of CUDA regions as DONTDUMP", total_mb)
 
 
 class AsyncIntermediateTensors(IntermediateTensors):
@@ -180,6 +207,9 @@ class Worker(WorkerBase):
             format_gib(freed_bytes),
             format_gib(used_bytes),
         )
+
+        if level == 2:
+            _mark_cuda_dontdump()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
