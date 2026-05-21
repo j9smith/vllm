@@ -209,9 +209,9 @@ class Worker(WorkerBase):
             format_gib(used_bytes),
         )
 
-        if level == 2:
-            logger.info("Calling cuda_dontdump")
-            _mark_cuda_dontdump()
+        logger.info("level: %s", {level})
+        logger.info("Calling cuda_dontdump")
+        _mark_cuda_dontdump()
 
         logger.info("Sleep routine finished")
 
