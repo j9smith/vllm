@@ -399,11 +399,10 @@ class Worker(WorkerBase):
 
     def reload_weights_fast(self, flat_file_path: str) -> None:
         logger.info("Reloading weights (fast-vllm)")
-        with torch.no_grad():
-            self.reload_weights(
-                weights_iterator=flat_file_iterator(flat_file_path),
-                is_checkpoint_format=False,
-            )
+        self.reload_weights(
+            weights_iterator=flat_file_iterator(flat_file_path),
+            is_checkpoint_format=False,
+        )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

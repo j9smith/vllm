@@ -5434,7 +5434,7 @@ class GPUModelRunner(
             loaded_weights = set()
             for name, loaded_weight in weights_iterator:
                 param = model.get_parameter(name)  # TODO: buffers?
-                param.copy_(loaded_weight)
+                param.data.copy_(loaded_weight)
                 loaded_weights.add(name)
 
         # logging and validation
