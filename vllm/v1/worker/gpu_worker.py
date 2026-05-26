@@ -81,6 +81,12 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+import json
+import mmap
+
+_DT = {str(d): d for d in (torch.bfloat16, torch.float16, torch.float32, torch.int8)}
+WEIGHTS_DUMP_PATH = os.environ.get("FAST_VLLM_WEIGHTS_PATH", "./weights")
+
 
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
@@ -165,6 +171,8 @@ class Worker(WorkerBase):
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
+        self._dump_weights(WEIGHTS_DUMP_PATH)
+
         # Save the buffers before level 2 sleep
         if level == 2:
             model = self.model_runner.model
@@ -183,6 +191,26 @@ class Worker(WorkerBase):
             format_gib(freed_bytes),
             format_gib(used_bytes),
         )
+
+    def _dump_weights(self, flat_file_path: str) -> None:
+        logger.info("Dumping weights (fast-vllm)")
+        model = self.get_model()
+        index, offset = {}, 0
+        with open(flat_file_path + ".bin", "wb") as f:
+            for name, p in model.named_parameters():
+                b = (
+                    p.data.detach()
+                    .contiguous()
+                    .flatten()
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes()
+                )
+                f.write(b)
+                index[name] = (offset, len(b), list(p.shape), str(p.dtype))
+                offset += len(b)
+        json.dump(index, open(flat_file_path + ".index", "w"))
+        logger.info("Dumped weights to %s", flat_file_path)
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         allocator = get_mem_allocator_instance()
@@ -367,6 +395,13 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
+
+    def reload_weights_fast(self, flat_file_path: str) -> None:
+        logger.info("Reloading weights (fast-vllm)")
+        self.reload_weights(
+            weights_iterator=flat_file_iterator(flat_file_path),
+            is_checkpoint_format=False,
+        )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -1159,6 +1194,17 @@ class Worker(WorkerBase):
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
+
+
+def flat_file_iterator(path):
+    index = json.load(open(path + ".index"))
+    fd = os.open(path + ".bin", os.O_RDONLY)
+    mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+    for name, (off, nbytes, shape, dt) in index.items():
+        raw = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=off)
+        yield name, raw.view(_DT[dt]).reshape(shape)
+    mm.close()
+    os.close(fd)
 
 
 def init_worker_distributed_environment(
