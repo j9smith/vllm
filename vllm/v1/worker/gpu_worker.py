@@ -193,6 +193,7 @@ class Worker(WorkerBase):
 
     def _dump_weights(self, flat_file_path: str) -> None:
         logger.info("Dumping weights (fast-vllm)")
+        os.makedirs(os.path.dirname(flat_file_path), exist_ok=True)
         model = self.get_model()
         index, offset = {}, 0
         with open(flat_file_path + ".bin", "wb") as f:
