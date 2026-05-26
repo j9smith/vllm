@@ -87,7 +87,6 @@ import mmap
 _DT = {str(d): d for d in (torch.bfloat16, torch.float16, torch.float32, torch.int8)}
 WEIGHTS_DUMP_PATH = os.environ.get("FAST_VLLM_WEIGHTS_PATH", "./weights")
 
-
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -200,6 +199,7 @@ class Worker(WorkerBase):
             for name, p in model.named_parameters():
                 b = (
                     p.data.detach()
+                    .cpu()
                     .contiguous()
                     .flatten()
                     .view(torch.uint8)
