@@ -84,6 +84,7 @@ if TYPE_CHECKING:
 import json
 import mmap
 import time
+import concurrent.futures
 
 _DT = {str(d): d for d in (torch.bfloat16, torch.float16, torch.float32, torch.int8)}
 WEIGHTS_DUMP_PATH = os.environ.get("FAST_VLLM_WEIGHTS_PATH", "./weights")
@@ -404,42 +405,45 @@ class Worker(WorkerBase):
 
         index = json.load(open(flat_file_path + ".index"))
         model = self.get_model()
+        bin_path = flat_file_path + ".bin"
+        total_bytes = os.path.getsize(bin_path)
 
-        # mmap the .bin for zero-copy view of the weights
-        fd = os.open(flat_file_path + ".bin", os.O_RDONLY)
-        mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
-        total_bytes = mm.size()
-        mm.madvise(mmap.MADV_WILLNEED)
-        logger.info("madvise: %.2fs", time.perf_counter() - t0)
-
-        # copy from mmap -> pinned staging buffer (pinned for DMA)
-        t1 = time.perf_counter()
+        # create pinned staging buffer
         staging = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
-        logger.info("pin_alloc: %.2fs", time.perf_counter() - t1)
+        mv = memoryview(staging.numpy())
 
-        t2 = time.perf_counter()
-        np.copyto(staging.numpy(), np.frombuffer(mm, dtype=np.uint8))
-        logger.info("copyto: %.2fs", time.perf_counter() - t2)
+        N = 8
+        fd = os.open(bin_path, os.O_RDONLY)
+        sub = (total_bytes + N - 1) // N # chunk size
+        t_read = time.perf_counter()
 
-        mm.close()
+        with concurrent.futures.ThreadPoolExecutor(N) as pool:
+            futs = []
+
+            for i in range(N):
+                off = i * sub
+                length = min(sub, total_bytes - off)
+                if length <= 0:
+                    break
+                # calls preadv(fd, buffer, offset) in parallel 
+                futs.append(pool.submit(os.preadv, fd, [mv[off:off + length]], off))
+            for f in futs:
+                f.result()
         os.close(fd)
+        logger.info("read: %.2fs", time.perf_counter() - t_read)
 
-        # h2d dma (cpu -> gpu), entire blob in one cudaMemcpyAsync
-        t3 = time.perf_counter()
+        # h2d dma (cpu -> gpu)
         gpu_buf = staging.cuda(non_blocking=True)
 
         # slice blob into params (GPU -> GPU, leverages L2)
         with torch.no_grad():
             for name, (off, nbytes, shape, dt) in index.items():
-                param = model.get_parameter(name)
                 src = gpu_buf[off:off + nbytes].view(_DT[dt]).reshape(shape)
-                param.data.copy_(src, non_blocking=True)
-
+                model.get_parameter(name).data.copy_(src, non_blocking=True)
         torch.cuda.synchronize()
-        logger.info("h2d: %.2fs", time.perf_counter() - t3)
 
-        logger.info("Reloaded weights (fast-vllm) in %.2fs", 
-                    time.perf_counter() - t0)
+        del gpu_buf
+        logger.info("Reloaded weights (fast-vllm) in %.2fs", time.perf_counter() - t0)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
