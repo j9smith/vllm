@@ -409,6 +409,7 @@ class Worker(WorkerBase):
         fd = os.open(flat_file_path + ".bin", os.O_RDONLY)
         mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
         total_bytes = mm.size()
+        mm.madvise(mmap.MADV_WILLNEED)
 
         # copy from mmap -> pinned staging buffer (pinned for DMA)
         staging = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
