@@ -400,6 +400,8 @@ class Worker(WorkerBase):
         self.model_runner.reload_weights(*args, **kwargs)
 
     def reload_weights_fast(self, flat_file_path: str) -> None:
+        """Reload weights from disk via parallelised double buffer that
+        enables simultaneous transfers from disk -> RAM and RAM -> GPU"""
         logger.info("Reloading weights (fast-vllm)")
         t0 = time.perf_counter()
 
@@ -407,6 +409,7 @@ class Worker(WorkerBase):
         model = self.get_model()
         fd = os.open(flat_file_path + ".bin", os.O_RDONLY)
 
+        # Group params into 512mb chunks
         CHUNK = 512 * 1024**2
         chunks, cur, acc = [], [], 0
         for name, meta in index:
@@ -419,36 +422,50 @@ class Worker(WorkerBase):
         span = lambda ch: ch[-1][1][0] + ch[-1][1][1] - ch[0][1][0]
         buf_size = max(span(ch) for ch in chunks)
 
+        # Create two pinned buffers in cpu mem
         host = [torch.empty(buf_size, dtype=torch.uint8, pin_memory=True)
                 for _ in range(2)]
 
         N = 8
         readers = concurrent.futures.ThreadPoolExecutor(max(N, 1))
-        orch = concurrent.futures.ThreadPoolExecutor(1)
+        orch = concurrent.futures.ThreadPoolExecutor(1) # orchestrator thread
 
         def fill(buf, ch):
+            """Move chunk from disk to pinned buffer in RAM. Uses N threads
+            to have multiple preadv in flight at once so we can saturate
+            NVMe."""
             start, size = ch[0][1][0], span(ch)
             mv = memoryview(buf.numpy())[:size]
             sub = (size + N - 1) // N
+
+            # Launch N parallel preadv calls on independent slices of the chunk
+            # disk -> page cache -> pinned buffer
             futs = [readers.submit(os.preadv, fd, [mv[i*sub:min((i+1)*sub, size)]],
                                 start + i*sub)
                     for i in range(N) if i*sub < size]
+            
+            # Block until all readers finish (chunk's bytes resident in buffer)
             for f in futs:
                 f.result()
             return start, size
 
+        # Double buffer pipeline
+        # Disk -> pinned mem and pinned mem -> VRAM happening in parallel
         t_read = time.perf_counter()
         with torch.no_grad():
             nxt = orch.submit(fill, host[0], chunks[0])
             for i, ch in enumerate(chunks):
-                start, size = nxt.result()
+                start, size = nxt.result() # wait for chunk i to be in host[i%2]
                 buf = host[i % 2]
                 if i + 1 < len(chunks):
+                    # start reading chunk i+1 into other pinned buffer
                     nxt = orch.submit(fill, host[(i + 1) % 2], chunks[i + 1])
-                gpu = buf[:size].cuda(non_blocking=True)
+                gpu = buf[:size].cuda(non_blocking=True) # pinned -> VRAM (DMA async)
                 for name, (off, nbytes, shape, dt) in ch:
                     rel = off - start
                     src = gpu[rel:rel + nbytes].view(_DT[dt]).reshape(shape)
+                    
+                    # load from VRAM into model params
                     model.get_parameter(name).data.copy_(src, non_blocking=True)
                 torch.cuda.synchronize()
                 del src, gpu
