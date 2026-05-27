@@ -410,14 +410,22 @@ class Worker(WorkerBase):
         mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
         total_bytes = mm.size()
         mm.madvise(mmap.MADV_WILLNEED)
+        logger.info("madvise: %.2fs", time.perf_counter() - t0)
 
         # copy from mmap -> pinned staging buffer (pinned for DMA)
+        t1 = time.perf_counter()
         staging = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
+        logger.info("pin_alloc: %.2fs", time.perf_counter() - t1)
+
+        t2 = time.perf_counter()
         np.copyto(staging.numpy(), np.frombuffer(mm, dtype=np.uint8))
+        logger.info("copyto: %.2fs", time.perf_counter() - t2)
+
         mm.close()
         os.close(fd)
 
         # h2d dma (cpu -> gpu), entire blob in one cudaMemcpyAsync
+        t3 = time.perf_counter()
         gpu_buf = staging.cuda(non_blocking=True)
 
         # slice blob into params (GPU -> GPU, leverages L2)
@@ -428,6 +436,7 @@ class Worker(WorkerBase):
                 param.data.copy_(src, non_blocking=True)
 
         torch.cuda.synchronize()
+        logger.info("h2d: %.2fs", time.perf_counter() - t3)
 
         logger.info("Reloaded weights (fast-vllm) in %.2fs", 
                     time.perf_counter() - t0)
