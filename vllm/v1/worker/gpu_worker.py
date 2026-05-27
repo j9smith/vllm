@@ -83,6 +83,7 @@ if TYPE_CHECKING:
 
 import json
 import mmap
+import time
 
 _DT = {str(d): d for d in (torch.bfloat16, torch.float16, torch.float32, torch.int8)}
 WEIGHTS_DUMP_PATH = os.environ.get("FAST_VLLM_WEIGHTS_PATH", "./weights")
@@ -399,10 +400,36 @@ class Worker(WorkerBase):
 
     def reload_weights_fast(self, flat_file_path: str) -> None:
         logger.info("Reloading weights (fast-vllm)")
-        self.reload_weights(
-            weights_iterator=flat_file_iterator(flat_file_path),
-            is_checkpoint_format=False,
-        )
+        t0 = time.perf_counter()
+
+        index = json.load(open(flat_file_path + ".index"))
+        model = self.get_model()
+
+        # mmap the .bin for zero-copy view of the weights
+        fd = os.open(flat_file_path + ".bin", os.O_RDONLY)
+        mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+        total_bytes = mmap.size()
+
+        # copy from mmap -> pinned staging buffer (pinned for DMA)
+        staging = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
+        np.copyto(staging.numpy(), np.frombuffer(mm, dtype=np.uint8))
+        mm.close()
+        os.close(fd)
+
+        # h2d dma (cpu -> gpu), entire blob in one cudaMemcpyAsync
+        gpu_buf = staging.cuda(non_blocking=True)
+
+        # slice blob into params (GPU -> GPU, leverages L2)
+        with torch.no_grad():
+            for name, (off, nbytes, shape, dt) in index.items():
+                param = model.get_parameter(name)
+                src = gpu_buf[off:off + nbytes].view(_DT[dt]).reshape(shape)
+                param.data.copy_(src, non_blocking=True)
+
+        torch.cuda.synchronize()
+
+        logger.info("Reloaded weights (fast-vllm) in %.2fs", 
+                    time.perf_counter() - t0)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
