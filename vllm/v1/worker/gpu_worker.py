@@ -422,7 +422,7 @@ class Worker(WorkerBase):
         host = [torch.empty(buf_size, dtype=torch.uint8, pin_memory=True)
                 for _ in range(2)]
 
-        N = 16
+        N = 8
         readers = concurrent.futures.ThreadPoolExecutor(max(N, 1))
         orch = concurrent.futures.ThreadPoolExecutor(1)
 
