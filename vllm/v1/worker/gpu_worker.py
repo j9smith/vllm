@@ -403,46 +403,59 @@ class Worker(WorkerBase):
         logger.info("Reloading weights (fast-vllm)")
         t0 = time.perf_counter()
 
-        index = json.load(open(flat_file_path + ".index"))
+        index = list(json.load(open(flat_file_path + ".index")).items())
         model = self.get_model()
-        bin_path = flat_file_path + ".bin"
-        total_bytes = os.path.getsize(bin_path)
+        fd = os.open(flat_file_path + ".bin", os.O_RDONLY)
 
-        # create pinned staging buffer
-        staging = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
-        mv = memoryview(staging.numpy())
+        CHUNK = 512 * 1024**2
+        chunks, cur, acc = [], [], 0
+        for name, meta in index:
+            cur.append((name, meta)); acc += meta[1]
+            if acc >= CHUNK:
+                chunks.append(cur); cur, acc = [], 0
+        if cur:
+            chunks.append(cur)
 
-        N = 8
-        fd = os.open(bin_path, os.O_RDONLY)
-        sub = (total_bytes + N - 1) // N # chunk size
-        t_read = time.perf_counter()
+        span = lambda ch: ch[-1][1][0] + ch[-1][1][1] - ch[0][1][0]
+        buf_size = max(span(ch) for ch in chunks)
 
-        with concurrent.futures.ThreadPoolExecutor(N) as pool:
-            futs = []
+        host = [torch.empty(buf_size, dtype=torch.uint8, pin_memory=True)
+                for _ in range(2)]
 
-            for i in range(N):
-                off = i * sub
-                length = min(sub, total_bytes - off)
-                if length <= 0:
-                    break
-                # calls preadv(fd, buffer, offset) in parallel 
-                futs.append(pool.submit(os.preadv, fd, [mv[off:off + length]], off))
+        N = 1
+        readers = concurrent.futures.ThreadPoolExecutor(max(N, 1))
+        orch = concurrent.futures.ThreadPoolExecutor(1)
+
+        def fill(buf, ch):
+            start, size = ch[0][1][0], span(ch)
+            mv = memoryview(buf.numpy())[:size]
+            sub = (size + N - 1) // N
+            futs = [readers.submit(os.preadv, fd, [mv[i*sub:min((i+1)*sub, size)]],
+                                start + i*sub)
+                    for i in range(N) if i*sub < size]
             for f in futs:
                 f.result()
-        os.close(fd)
-        logger.info("read: %.2fs", time.perf_counter() - t_read)
+            return start, size
 
-        # h2d dma (cpu -> gpu)
-        gpu_buf = staging.cuda(non_blocking=True)
-
-        # slice blob into params (GPU -> GPU, leverages L2)
+        t_read = time.perf_counter()
         with torch.no_grad():
-            for name, (off, nbytes, shape, dt) in index.items():
-                src = gpu_buf[off:off + nbytes].view(_DT[dt]).reshape(shape)
-                model.get_parameter(name).data.copy_(src, non_blocking=True)
-        torch.cuda.synchronize()
+            nxt = orch.submit(fill, host[0], chunks[0])
+            for i, ch in enumerate(chunks):
+                start, size = nxt.result()
+                buf = host[i % 2]
+                if i + 1 < len(chunks):
+                    nxt = orch.submit(fill, host[(i + 1) % 2], chunks[i + 1])
+                gpu = buf[:size].cuda(non_blocking=True)
+                for name, (off, nbytes, shape, dt) in ch:
+                    rel = off - start
+                    src = gpu[rel:rel + nbytes].view(_DT[dt]).reshape(shape)
+                    model.get_parameter(name).data.copy_(src, non_blocking=True)
+                torch.cuda.synchronize()
+                del src, gpu
+        torch.cuda.empty_cache()
 
-        del gpu_buf
+        readers.shutdown(); orch.shutdown(); os.close(fd)
+        logger.info("read+load: %.2fs", time.perf_counter() - t_read)
         logger.info("Reloaded weights (fast-vllm) in %.2fs", time.perf_counter() - t0)
 
     @torch.inference_mode()
