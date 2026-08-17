@@ -25,6 +25,7 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_block_hashes,
 )
+from vllm.v1.core.kv_hints import HintConfig, KVHintManager, HintState
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -189,6 +190,8 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+
+        self.hints = KVHintManager(HintConfig())
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -645,20 +648,25 @@ class BlockPool:
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """Get new blocks from the free block pool.
-
-        Note that we do not check block cache in this function.
-
-        Args:
-            num_blocks: The number of blocks to allocate.
-
-        Returns:
-            A list of new block.
-        """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # 1. corpses (dontneed)
+        ret: list[KVCacheBlock] = self.hints.popleft_dead_n(num_blocks)
+        if len(ret) < num_blocks:
+            self.hints.note_normal_alloc(num_blocks - len(ret))
+            n = min(num_blocks - len(ret), self.free_block_queue.num_free_blocks)
+            drained = self.free_block_queue.popleft_n(n)
+            self.hints.note_shadow_evicted(drained)
+            ret.extend(drained)
+        # 3. willneed: later before soon
+        if len(ret) < num_blocks:
+            ret.extend(self.hints.popleft_n(num_blocks - len(ret)))
+
+        assert len(ret) == num_blocks, (
+            f"allocated {len(ret)} of {num_blocks}: free-block accounting is out "
+            f"of sync with the queues"
+        )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -711,7 +719,13 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                if block.hint_state == HintState.WILLNEED_SHADOW:
+                    self.hints.note_shadow_survived(block)
+                    self.free_block_queue.remove(block)
+                elif block.hint_state:
+                    self.hints.remove(block)
+                else:
+                    self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -767,6 +781,9 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        # Remove all hints
+        self.hints.drain_all(self)
+
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
@@ -800,7 +817,7 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.free_block_queue.num_free_blocks + self.hints.num_free_blocks
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

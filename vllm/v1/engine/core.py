@@ -803,6 +803,19 @@ class EngineCore:
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
+    def apply_kv_hint(
+        self, request_id, expect_return_ms, done, sequence_id: str | None = None
+    ) -> dict:
+        return self.scheduler.kv_cache_manager.apply_kv_hint(
+            request_id, expect_return_ms, done, sequence_id
+        )
+
+    def kv_hint_stats(self) -> dict:
+        return self.scheduler.kv_cache_manager.kv_hint_stats()
+
+    def kv_hint_reset_stats(self) -> None:
+        self.scheduler.kv_cache_manager.kv_hint_reset_stats()
+
     def _reset_caches(
         self,
         reset_running_requests: bool = True,

@@ -928,6 +928,23 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def kv_hint(
+        self,
+        request_id: str,
+        expect_return_ms=None,
+        done: bool = False,
+        sequence_id: str | None = None,
+    ) -> dict:
+        return await self.engine_core.kv_hint_async(
+            request_id, expect_return_ms, done, sequence_id
+        )
+
+    async def kv_hint_stats(self) -> dict:
+        return await self.engine_core.kv_hint_stats_async()
+
+    async def kv_hint_reset_stats(self) -> None:
+        await self.engine_core.kv_hint_reset_stats_async()
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
             await self.renderer.clear_mm_cache_async()

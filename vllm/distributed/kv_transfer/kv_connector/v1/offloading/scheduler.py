@@ -420,6 +420,8 @@ class OffloadingConnectorScheduler:
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
+        self._gpu_block_pool = None
+
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
     ) -> None:
@@ -1138,6 +1140,8 @@ class OffloadingConnectorScheduler:
             assert self._jobs[any_jid].is_store
             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
 
+        _n_preempt_flush = len(self._current_batch_jobs_to_flush)
+
         # Flush jobs that contain re-allocated blocks.
         if (
             self._block_id_to_pending_jobs
@@ -1157,6 +1161,7 @@ class OffloadingConnectorScheduler:
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
+        
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
@@ -1193,6 +1198,11 @@ class OffloadingConnectorScheduler:
                     _TransferMetricName.LOAD_TIME,
                     meta.transfer_stats.load.time,
                 )
+                if self._gpu_block_pool is not None:
+                    self._gpu_block_pool.hints.transfers.observe(
+                        meta.transfer_stats.load.time,
+                        meta.transfer_stats.load.bytes,
+                    )
                 for size in meta.transfer_stats.load.sizes:
                     transfer_stats.observe_histogram(
                         _TransferMetricName.LOAD_SIZE, size

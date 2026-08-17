@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -161,6 +162,24 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        hcfg = self.block_pool.hints.config
+        if hcfg.bytes_per_block <= 0:
+            groups = kv_cache_config.kv_cache_groups
+            if len(groups) == 1 and isinstance(
+                groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+            ):
+                hcfg.bytes_per_block = groups[0].kv_cache_spec.page_size_bytes
+            else:
+                specs = {g.kv_cache_spec.page_size_bytes for g in groups}
+                layers = max((len(g.layer_names) for g in groups), default=0)
+                hcfg.bytes_per_block = (
+                    specs.pop() * layers if len(specs) == 1 and layers else 0
+                )
+            logger.info(
+                "kv_hint: bytes_per_block=%d (%d group(s), %d layers)",
+                hcfg.bytes_per_block, len(groups),
+                max((len(g.layer_names) for g in groups), default=0),
+            )
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -268,6 +287,14 @@ class KVCacheManager:
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
+
+        if self.block_pool.hints.config.enabled:
+            _bs = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+            self.block_pool.hints.probe_first_miss(
+                request.block_hashes,
+                num_new_computed_tokens // _bs,
+                request.request_id,
+            )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -511,6 +538,17 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        # Grab content hashes of blocks and attach them to sequence ID
+        # so that we can apply hints out-of-band
+        if self.block_pool.hints.config.record_chains:
+            hashes = [
+                b.block_hash
+                for group in self.coordinator.get_blocks(request.request_id)
+                for b in group
+                if b.block_hash is not None and not b.is_null
+            ]
+            self.block_pool.hints.record_finished(request.request_id, hashes)
+
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -758,3 +796,25 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+
+    def apply_kv_hint(
+        self,
+        req_id: str,
+        expect_return_ms=None,
+        done=False,
+        sequence_id: str | None = None,
+    ) -> dict:
+        return self.block_pool.hints.apply(
+            req_id,
+            expect_return_ms=expect_return_ms,
+            done=done,
+            pool=self.block_pool,
+            sequence_id=sequence_id,
+        )
+
+    def kv_hint_stats(self) -> dict:
+        self.block_pool.hints.sync_transfer_stats()
+        return self.block_pool.hints.stats.as_dict()
+
+    def kv_hint_reset_stats(self) -> None:
+        self.block_pool.hints.reset_stats()

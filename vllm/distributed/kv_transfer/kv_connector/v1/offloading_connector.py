@@ -134,6 +134,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        # Scheduler role only. Overrides the base-class no-op so the connector
+        # can feed observed CPU->GPU transfer times to the hint manager.
+        if self.connector_scheduler is not None:
+            self.connector_scheduler._gpu_block_pool = gpu_block_pool
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:

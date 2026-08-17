@@ -1156,6 +1156,19 @@ class AsyncMPClient(MPClient):
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
 
+    async def kv_hint_async(
+        self, request_id, expect_return_ms, done, sequence_id: str | None = None
+    ) -> dict:
+        return await self.call_utility_async(
+            "apply_kv_hint", request_id, expect_return_ms, done, sequence_id
+        )
+
+    async def kv_hint_stats_async(self) -> dict:
+        return await self.call_utility_async("kv_hint_stats")
+
+    async def kv_hint_reset_stats_async(self) -> None:
+        await self.call_utility_async("kv_hint_reset_stats")
+
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)
 

@@ -458,6 +458,21 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Expire overdue hints and move blocks to end of normal queue
+        pool = self.kv_cache_manager.block_pool
+        pool.hints.sched_step = self.current_step
+        if pool.hints.config.enabled:
+            pool.hints.reap(pool)
+        # NOT gated on enabled -- the control arm needs this series too.
+        if self.current_step % 200 == 0:
+            pool.hints.probe_prologue(pool)
+            s = pool.hints.stats
+            s.census_samples += 1
+            s.remote_kv_waiters_sum += sum(
+                1 for r in self.skipped_waiting
+                if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS)
+            s.inflight_reserved_sum += self._inflight_prefill_reserved_blocks()
+
         self.kv_cache_manager.new_step_starts()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -2258,6 +2273,14 @@ class Scheduler(SchedulerInterface):
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
+            if self.kv_cache_manager.block_pool.hints.config.record_chains:
+                hashes = [
+                    b.block_hash for b in blocks
+                    if b.block_hash is not None and not b.is_null
+                ]
+                self.kv_cache_manager.block_pool.hints.record_finished(
+                    request.request_id, hashes
+                )
             self.deferred_frees.append((self.sched_step_seq, blocks))
 
     def _free_cow_retained_blocks(

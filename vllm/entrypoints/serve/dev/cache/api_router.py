@@ -66,5 +66,26 @@ async def reset_encoder_cache(raw_request: Request):
     return Response(status_code=200)
 
 
+@router.post("/kv_hint")
+async def kv_hint(raw_request: Request):
+    body = await raw_request.json()
+    result = await engine_client(raw_request).kv_hint(
+        request_id=body["request_id"],
+        expect_return_ms=body.get("expect_return_ms"),
+        done=bool(body.get("done", False)),
+        sequence_id=body.get("sequence_id"),
+    )
+    return JSONResponse(result)
+
+
+@router.get("/kv_hint/stats")
+async def kv_hint_stats(raw_request: Request):
+    return JSONResponse(await engine_client(raw_request).kv_hint_stats())
+
+@router.post("/kv_hint/reset_stats")
+async def kv_hint_reset_stats(raw_request: Request):
+    await engine_client(raw_request).kv_hint_reset_stats()
+    return Response(status_code=200)
+
 def attach_router(app: FastAPI):
     app.include_router(router)

@@ -137,6 +137,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    hint_state: int = 0
+    hint_epoch: int = -1
+    hint_in_head: bool = False
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
